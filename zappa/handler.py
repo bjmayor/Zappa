@@ -1,57 +1,37 @@
 from __future__ import unicode_literals
 
+import base64
+import boto3
+import collections
 import datetime
 import importlib
-import logging
-import traceback
-import os
-import json
 import inspect
-import collections
-import zipfile
-import base64
-
-import boto3
+import json
+import logging
+import os
 import sys
+import traceback
+import zipfile
+
+from builtins import str
 from werkzeug.wrappers import Response
 
 # This file may be copied into a project's root,
 # so handle both scenarios.
 try:
-    from zappa.cli import ZappaCLI
     from zappa.middleware import ZappaWSGIMiddleware
     from zappa.wsgi import create_wsgi_request, common_log
-    from zappa.util import parse_s3_url
+    from zappa.utilities import parse_s3_url
 except ImportError as e:  # pragma: no cover
-    from .cli import ZappaCLI
     from .middleware import ZappaWSGIMiddleware
     from .wsgi import create_wsgi_request, common_log
-    from .util import parse_s3_url
+    from .utilities import parse_s3_url
 
 
 # Set up logging
 logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-
-class WSGIException(Exception):
-    """
-    This exception is used by the handler to indicate that underlying WSGI app has returned a non-2xx(3xx) code.
-    """
-
-    pass
-
-
-class UncaughtWSGIException(Exception):
-    """
-    Indicates a problem that happened outside of WSGI app context (and thus wasn't handled by the WSGI app itself)
-    while processing a request from API Gateway.
-    """
-
-    def __init__(self, message, original=None):
-        super(UncaughtWSGIException, self).__init__(message)
-        self.original = original
 
 
 class LambdaHandler(object):
@@ -74,7 +54,11 @@ class LambdaHandler(object):
     def __new__(cls, settings_name="zappa_settings", session=None):
         """Singleton instance to avoid repeat setup"""
         if LambdaHandler.__instance is None:
-            LambdaHandler.__instance = object.__new__(cls, settings_name, session)
+            if sys.version_info[0] < 3:
+                LambdaHandler.__instance = object.__new__(cls, settings_name, session)
+            else:
+                print("Instancing..")
+                LambdaHandler.__instance = object.__new__(cls)
         return LambdaHandler.__instance
 
     def __init__(self, settings_name="zappa_settings", session=None):
@@ -117,8 +101,26 @@ class LambdaHandler(object):
             if project_zip_path:
                 self.load_remote_project_zip(project_zip_path)
 
+
+            # Load compliled library to the PythonPath
+            # checks if we are the slim_handler since this is not needed otherwise
+            # https://github.com/Miserlou/Zappa/issues/776
+            is_slim_handler = getattr(self.settings, 'SLIM_HANDLER', False)
+            if is_slim_handler:
+                included_libraries = getattr(self.settings, 'INCLUDE', ['libmysqlclient.so.18'])
+                try:
+                    from ctypes import cdll, util
+                    for library in included_libraries:
+                        try:
+                            cdll.LoadLibrary(os.path.join(os.getcwd(), library))
+                        except OSError:
+                            print ("Failed to find library...right filename?")
+                except ImportError:
+                    print ("Failed to import cytpes library")
+
             # This is a non-WSGI application
-            if not hasattr(self.settings, 'APP_MODULE') and not hasattr(self.settings, 'DJANGO_SETTINGS'):
+            # https://github.com/Miserlou/Zappa/pull/748
+            if not hasattr(self.settings, 'APP_MODULE') and not self.settings.DJANGO_SETTINGS:
                 self.app_module = None
                 wsgi_app_function = None
             # This is probably a normal WSGI app
@@ -168,7 +170,7 @@ class LambdaHandler(object):
 
         # Add to project path
         sys.path.insert(0, project_folder)
-        
+
         # Change working directory to project folder
         # Related: https://github.com/Miserlou/Zappa/issues/702
         os.chdir(project_folder)
@@ -195,7 +197,7 @@ class LambdaHandler(object):
             return
 
         try:
-            content = remote_env_object['Body'].read().decode('utf-8')
+            content = remote_env_object['Body'].read()
         except Exception as e:  # pragma: no cover
             # catch everything aws might decide to raise
             print('Exception while reading remote settings file.', e)
@@ -239,17 +241,6 @@ class LambdaHandler(object):
         exception_handler = handler.settings.EXCEPTION_HANDLER
         try:
             return handler.handler(event, context)
-        except WSGIException as wsgi_ex:
-            # do nothing about LambdaExceptions since those are already handled (or should be handled by the WSGI app).
-            raise wsgi_ex
-        except UncaughtWSGIException as u_wsgi_ex:
-            # hand over original error to exception handler, since the exception happened outside of WSGI app context
-            # (it wasn't propertly processed by the app itself)
-            cls._process_exception(exception_handler=exception_handler,
-                                   event=event, context=context, exception=u_wsgi_ex.original)
-            # raise unconditionally since it's an API gateway error (i.e. client expects to see a 500 and execution
-            # won't be retried).
-            raise u_wsgi_ex
         except Exception as ex:
             exception_processed = cls._process_exception(exception_handler=exception_handler,
                                                          event=event, context=context, exception=ex)
@@ -288,20 +279,6 @@ class LambdaHandler(object):
             raise RuntimeError("Function signature is invalid. Expected a function that accepts at most "
                                "2 arguments or varargs.")
         return result
-
-    def update_certificate(self):
-        """
-        Call 'certify' locally.
-        """
-        import boto3
-        session = boto3.Session()
-
-        z_cli = ZappaCLI()
-        z_cli.api_stage = self.settings.API_STAGE
-        z_cli.load_settings(session=session)
-        z_cli.certify()
-
-        return
 
     def get_function_for_aws_event(self, record):
         """
@@ -457,7 +434,7 @@ class LambdaHandler(object):
                     if settings.BINARY_SUPPORT:
                         if not response.mimetype.startswith("text/") \
                             or response.mimetype != "application/json":
-                                zappa_returndict['body'] = base64.b64encode(response.data)
+                                zappa_returndict['body'] = base64.b64encode(response.data).decode('utf-8')
                                 zappa_returndict["isBase64Encoded"] = "true"
                         else:
                             zappa_returndict['body'] = response.data
@@ -499,7 +476,7 @@ class LambdaHandler(object):
             body = {'message': message}
             if settings.DEBUG:  # only include traceback if debug is on.
                 body['traceback'] = traceback.format_exception(*exc_info)  # traceback as a list for readability.
-            content['body'] = json.dumps(body, sort_keys=True, indent=4).encode('utf-8')
+            content['body'] = json.dumps(str(body), sort_keys=True, indent=4)
             return content
 
 
@@ -511,11 +488,3 @@ def keep_warm_callback(event, context):
     """Method is triggered by the CloudWatch event scheduled when keep_warm setting is set to true."""
     lambda_handler(event={}, context=context)  # overriding event with an empty one so that web app initialization will
     # be triggered.
-
-
-def certify_callback(event, context):
-    """
-    Load our LH settings and update our cert.
-    """
-    lh = LambdaHandler()
-    return lh.update_certificate()

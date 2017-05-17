@@ -5,10 +5,16 @@ import fnmatch
 import json
 import os
 import re
-import requests
 import shutil
 import stat
-import urlparse
+import sys
+
+from past.builtins import basestring
+
+if sys.version_info[0] < 3:
+    from urlparse import urlparse
+else:
+    from urllib.parse import urlparse
 
 ##
 # Settings / Packaging
@@ -58,7 +64,7 @@ def parse_s3_url(url):
     bucket = ''
     path = ''
     if url:
-        result = urlparse.urlparse(url)
+        result = urlparse(url)
         bucket = result.netloc
         path = result.path.strip('/')
     return bucket, path
@@ -154,6 +160,25 @@ def detect_flask_apps():
                     matches.append(app_module)
 
     return matches
+
+def get_venv_from_python_version():
+    return 'python' + str(sys.version_info[0]) + '.' + str(sys.version_info[1])
+
+def get_runtime_from_python_version():
+    """
+    """
+    if sys.version_info[0] < 3:
+        return 'python2.7'
+    else:
+        return 'python3.6'
+
+##
+# Async Tasks
+##
+
+def get_topic_name(lambda_name):
+    """ Topic name generation """
+    return '%s-zappa-async' % lambda_name
 
 ##
 # Event sources / Kappa
@@ -289,6 +314,7 @@ def check_new_version_available(this_version):
     Returns True is updateable, else False.
 
     """
+    import requests
 
     pypi_url = 'https://pypi.python.org/pypi/Zappa/json'
     resp = requests.get(pypi_url, timeout=1.5)
@@ -333,3 +359,10 @@ def validate_name(name, maxlen=80):
         msg = "Name can only contain characters from a-z, A-Z, 0-9, _ and -"
         raise InvalidAwsLambdaName(msg)
     return name
+
+
+def contains_python_files_or_subdirs(dirs, files):
+    """
+    checks if len of dirs greater 0 or if there are any files ending on .py or .pyc in files
+    """
+    return len(dirs) > 0 or len([filename for filename in files if filename.endswith('.py') or filename.endswith('.pyc')]) > 0
